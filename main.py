@@ -1,10 +1,9 @@
-import time
-import uuid
-import base64
-
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import uuid
+import time
+import base64
 
 TOTAL_ORDERS = 53
 RATE_LIMIT = 19
@@ -12,67 +11,54 @@ WINDOW = 10  # seconds
 
 app = FastAPI()
 
-# Enable CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------
-# In-memory stores
-# -------------------------
-
-# Idempotency store
+# -----------------------------
+# Storage
+# -----------------------------
 idempotency_store = {}
+client_buckets = {}
 
-# Rate limiter
-client_requests = {}
-
-
-# -------------------------
-# Rate limiting middleware
-# -------------------------
-
+# -----------------------------
+# Rate Limiter Middleware
+# -----------------------------
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
 
-    client = request.headers.get("X-Client-Id", "anonymous")
-
+    client = request.headers.get("X-Client-Id", "default")
     now = time.time()
 
-    timestamps = client_requests.setdefault(client, [])
+    bucket = client_buckets.setdefault(client, [])
 
     # Remove expired timestamps
-    timestamps[:] = [t for t in timestamps if now - t < WINDOW]
+    bucket[:] = [t for t in bucket if now - t < WINDOW]
 
-    if len(timestamps) >= RATE_LIMIT:
-
-        retry_after = WINDOW - (now - timestamps[0])
-
+    if len(bucket) >= RATE_LIMIT:
+        retry = max(1, int(WINDOW - (now - bucket[0])))
         return JSONResponse(
             status_code=429,
-            content={"detail": "Rate limit exceeded"},
-            headers={
-                "Retry-After": str(max(1, int(retry_after)))
-            }
+            content={"detail": "Too Many Requests"},
+            headers={"Retry-After": str(retry)},
         )
 
-    timestamps.append(now)
-
+    bucket.append(now)
     return await call_next(request)
 
 
-# -------------------------
-# Idempotent POST
-# -------------------------
-
+# -----------------------------
+# POST /orders
+# -----------------------------
 @app.post("/orders", status_code=201)
 def create_order(
-    request: dict,
-    idempotency_key: str = Header(None, alias="Idempotency-Key")
+    body: dict = Body(default={}),
+    idempotency_key: str = Header(None, alias="Idempotency-Key"),
 ):
 
     if not idempotency_key:
@@ -83,46 +69,44 @@ def create_order(
 
     order = {
         "id": str(uuid.uuid4()),
-        "payload": request
+        **body,
     }
 
     idempotency_store[idempotency_key] = order
-
     return order
 
 
-# -------------------------
-# Cursor Pagination
-# -------------------------
-
+# -----------------------------
+# GET /orders
+# -----------------------------
 @app.get("/orders")
-def list_orders(limit: int = 10, cursor: str = None):
+def list_orders(limit: int = 10, cursor: str | None = None):
 
-    if limit <= 0:
-        limit = 10
+    if limit < 1:
+        limit = 1
 
     start = 1
 
     if cursor:
-        start = int(base64.b64decode(cursor).decode())
+        try:
+            start = int(base64.urlsafe_b64decode(cursor.encode()).decode())
+        except Exception:
+            start = 1
 
     end = min(start + limit - 1, TOTAL_ORDERS)
 
-    items = [
-        {
-            "id": i
-        }
-        for i in range(start, end + 1)
-    ]
+    items = [{"id": i} for i in range(start, end + 1)]
 
-    if end >= TOTAL_ORDERS:
-        next_cursor = None
-    else:
-        next_cursor = base64.b64encode(
-            str(end + 1).encode()
-        ).decode()
+    next_cursor = None
+    if end < TOTAL_ORDERS:
+        next_cursor = base64.urlsafe_b64encode(str(end + 1).encode()).decode()
 
     return {
         "items": items,
-        "next_cursor": next_cursor
+        "next_cursor": next_cursor,
     }
+
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
